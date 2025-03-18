@@ -17,111 +17,7 @@ import torchvision.transforms as transforms
 from PIL import Image
 
 
-# region functions
-def flow_vector(flow, spacing, margin, minlength):
-    """Parameters:
-    input
-    flow: motion vectors 3D-array
-    spacing: pixel spacing of the flow
-    margin: pixel margins of the flow
-    minlength: minimum pixels to leave as flow
-    output
-    x: x coord 1D-array
-    y: y coord 1D-array
-    u: x direction flow vector 2D-array
-    v: y direction flow vector 2D-array
-    """
-    h, w, _ = flow.shape
-
-    x = np.arange(margin, w - margin, spacing, dtype=np.int64)
-    y = np.arange(margin, h - margin, spacing, dtype=np.int64)
-
-    mesh_flow = flow[np.ix_(y, x)]
-    mag, _ = cv2.cartToPolar(mesh_flow[..., 0], mesh_flow[..., 1])
-    mag = mag
-    mesh_flow[mag < minlength] = np.nan  # minlength以下をnanに置換
-
-    u = mesh_flow[..., 0]
-    v = mesh_flow[..., 1]
-
-    return x, y, u, v
-
-def adjust_ang(ang_min, ang_max):
-    """Parameters
-    input
-    ang_min: start angle of degree
-    ang_max: end angle of degree
-    output
-    unique_ang_min: angle after conversion to unique `ang_min`
-    unique_ang_max: angle after conversion to unique `ang_max`
-    """
-    unique_ang_min = ang_min
-    unique_ang_max = ang_max
-    unique_ang_min %= 360
-    unique_ang_max %= 360
-    if unique_ang_min >= unique_ang_max:
-        unique_ang_max += 360
-    return unique_ang_min, unique_ang_max
-
-def any_angle_only(mag, ang, ang_min, ang_max):
-    """
-    input
-    mag: `cv2.cartToPolar` method `mag` reuslts
-    ang: `cv2.cartToPolar` method `ang` reuslts
-    ang_min: start angle of degree after `adjust_ang` function
-    ang_max: end angle of degree after `adjust_ang` function
-    output
-    any_mag: array of replace any out of range `ang` with nan
-    any_ang: array of replace any out of range `mag` with nan
-    description
-    Replace any out of range `mag` and `ang` with nan.
-    """
-    any_mag = np.copy(mag)
-    any_ang = np.copy(ang)
-    ang_min %= 360
-    ang_max %= 360
-    if ang_min < ang_max:
-        any_mag[(ang < ang_min) | (ang_max < ang)] = np.nan
-        any_ang[(ang < ang_min) | (ang_max < ang)] = np.nan
-    else:
-        any_mag[(ang_max < ang) & (ang < ang_min)] = np.nan
-        any_ang[(ang_max < ang) & (ang < ang_min)] = np.nan
-        any_ang[ang <= ang_max] += 360
-    return any_mag, any_ang
-
-def hsv_cmap(ang_min, ang_max, size):
-    """
-    input
-    ang_min: start angle of degree after `adjust_ang` function
-    ang_max: end angle of degree after `adjust_ang` function
-    size: map px size
-    output
-    hsv_cmap_rgb: HSV color map in radial vector flow
-    x, y, u, v: radial vector flow value
-    x: x coord 1D-array
-    y: y coord 1D-array
-    u: x direction flow vector 2D-array
-    v: y direction flow vector 2D-array
-    description
-    Create a normalized hsv colormap between `ang_min` and `ang_max`.
-    """
-    # 放射状に広がるベクトル場の生成
-    half = size // 2
-    x = np.arange(-half, half+1, 1, dtype=np.float64)
-    y = np.arange(-half, half+1, 1, dtype=np.float64)
-    u, v = np.meshgrid(x, y)
-
-    # HSV色空間の配列に入れる
-    hsv = np.zeros((len(y), len(x), 3), dtype='uint8')
-    mag, ang = cv2.cartToPolar(u, v, angleInDegrees=True)
-    any_mag, any_ang = any_angle_only(mag, ang, ang_min, ang_max)
-    hsv[..., 0] = 180*(any_ang - ang_min) / (ang_max - ang_min)
-    hsv[..., 1] = 255
-    hsv[..., 2] = cv2.normalize(any_mag, None, 0, 255, cv2.NORM_MINMAX)
-    hsv_cmap_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
-
-    return hsv_cmap_rgb, x, y, u, v
-
+# region CAMixer
 def flow_warp(x,
               flow,
               interpolation='bilinear',
@@ -168,16 +64,6 @@ def flow_warp(x,
         align_corners=align_corners)
     return output
 
-def tensor_to_cv(tensor):
-    """将PyTorch Tensor转换为OpenCV图像格式（保持BGR顺序）"""
-    img = tensor.squeeze(0).detach().cpu()  # (C, H, W)
-    img = img.permute(1, 2, 0).numpy()        # (H, W, C)
-    img = (img * 255).clip(0, 255).astype(np.uint8)
-    return img  # 保持BGR
-
-# endregion
-
-# region CAMixer
 class LayerNorm(nn.Module):
     r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
     The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
@@ -587,8 +473,10 @@ if __name__ == '__main__':
 
     Image_path = '10.160.15.241C02096-20220510133047_0002.jpg'
     block_size = 16  # 每个block采样一个箭头
-    arrow_scale = 100 # 箭头缩放因子（根据实际数据调整）
+    arrow_scale = 50 # 箭头缩放因子（根据实际数据调整）
+    arrow_alpha = 0.7
     dpi = 100  # 保证720x480像素 = (7.2,4.8)*100dpi
+    min_magnitude = 0.0355
 
     img = Image.open(Image_path).convert('RGB')
 
@@ -605,54 +493,72 @@ if __name__ == '__main__':
 
     # 读取原始图像（BGR格式）
     img_ori = cv2.imread(Image_path)
-    # 转为Tensor（注意：转换后Tensor的通道顺序仍为BGR）
-    img_ori_tensor = transforms.ToTensor()(img_ori)
-    img_ori_tensor = img_ori_tensor.unsqueeze(0).cuda()
-
-    # 转换原始图像，便于后续光流计算
-    img_ori_cv = tensor_to_cv(img_ori_tensor)
-    img_ori_gray = cv2.cvtColor(img_ori_cv, cv2.COLOR_BGR2GRAY)
+    raw_img = Image.open(Image_path)
+    img_width, img_height = raw_img.size
 
     # 遍历每个mask，单独生成结果图并保存
     num_masks = len(mask)   # mask 为 list 类型，长度为20
 
     for idx in range(num_masks):
-        # 使用当前mask的第二个元素进行图像形变
-        warped_tensor = flow_warp(img_ori_tensor, mask[idx][1].permute(0, 2, 3, 1),
-                                interpolation='bilinear', padding_mode='border')
-        
-        print(mask[idx][1].shape)
-        # 转换形变后的图像为OpenCV格式（BGR）
-        warped_cv = tensor_to_cv(warped_tensor)
-        # 灰度图，用于计算光流
-        warped_gray = cv2.cvtColor(warped_cv, cv2.COLOR_BGR2GRAY)
-        
-        # 计算光流（原始图像与形变图之间的光流）
-        flow = cv2.calcOpticalFlowFarneback(img_ori_gray, warped_gray, None,
-                                            0.5, 3, 15, 3, 5, 1.2, 0)
-        # 提取光流向量（请确保 flow_vector 已实现，返回 x, y, u, v）
-        x, y, u, v = flow_vector(flow, spacing=10, margin=0, minlength=0.35)
+        offset = mask[idx][1].detach().cpu().numpy()
+        # 提取U和V分量
+        U = offset[0, 0]  # 水平偏移量 [480,720]
+        V = offset[0, 1]  # 垂直偏移量 [480,720]
 
-        # 调整箭头大小
-        u = u * 250
-        v = v * 250
+        # 采样网格
+        x_blocks = np.arange(block_size//2, img_width, block_size)
+        y_blocks = np.arange(block_size//2, img_height, block_size)
+        X, Y = np.meshgrid(x_blocks, y_blocks)
         
-        # 转换为RGB便于 matplotlib 显示
-        warped_rgb = cv2.cvtColor(warped_cv, cv2.COLOR_BGR2RGB)
+        # 采样位移量
+        U_sampled = U[Y.astype(int), X.astype(int)]
+        V_sampled = V[Y.astype(int), X.astype(int)]
+        C = np.hypot(U_sampled, V_sampled)  # 颜色编码依据
+
+        mask2 = C > min_magnitude
+        X = X[mask2]
+        Y = Y[mask2]
+        U_sampled = U_sampled[mask2] * arrow_scale
+        V_sampled = V_sampled[mask2] * arrow_scale
+        C = C[mask2]
+                
+        # 创建画布
+        fig = plt.figure(figsize=(img_width/dpi, img_height/dpi), dpi=dpi)
+        ax = fig.add_axes([0, 0, 1, 1])
         
-        # 根据结果图像的尺寸，动态设置 figure 尺寸（确保保存的图像与原始图像尺寸一致）
-        height, width = warped_rgb.shape[:2]
-        dpi = 100  # 你可以根据需要调整 dpi
-        figsize = (width/dpi, height/dpi)
-        fig, ax = plt.subplots(figsize=figsize, dpi=dpi)
+        # 显示原图
+        ax.imshow(raw_img)
         
-        ax.imshow(warped_rgb)
-        ax.quiver(x, y, u, v, angles='xy', scale_units='xy', scale=10, color=[0.0, 1.0, 0.0])
+        # 绘制彩色箭头（关键修改部分）
+        Q = ax.quiver(
+            X, Y,
+            U_sampled,
+            V_sampled,
+            C,  # 颜色编码数据
+            cmap='jet',  # 恢复颜色映射
+            angles='xy',
+            scale_units='xy',
+            scale=1,
+            width=0.004,
+            alpha=arrow_alpha,
+            headwidth=3,
+            headlength=4,
+            headaxislength=3,
+            clim=(C.min(), C.max())  # 确保颜色范围匹配当前数据
+        )
+        
+        # 隐藏坐标轴和颜色条
         ax.axis('off')
-        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
-            
-        # 保存当前图像，pad_inches=0 去除额外填充
-        save_path = os.path.join(output_dir, f"offsets{idx}.png")
-        plt.savefig(save_path, bbox_inches='tight', pad_inches=0)
-        plt.close(fig)
-        print(f"保存图像：{save_path}")
+        
+        # 保存图像（无颜色条）
+        save_path = os.path.join(output_dir, f"overlay_{idx:03d}.png")
+        plt.savefig(
+            save_path,
+            bbox_inches='tight',
+            pad_inches=0,
+            dpi=dpi,
+            transparent=True
+        )
+        plt.close()
+        
+        print(f"已保存：{save_path}")
